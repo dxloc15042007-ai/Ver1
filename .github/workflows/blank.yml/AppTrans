@@ -1,0 +1,478 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tạo mã nguồn app
+        run: |
+          P=app/src/main/java/com/example/screentranslator
+          mkdir -p $P app/src/main/res/xml app/src/main/res/values
+
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "ScreenTranslator"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+
+          echo "android.useAndroidX=true" > gradle.properties
+
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.screentranslator"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.screentranslator"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("com.google.mlkit:text-recognition-chinese:16.0.1")
+              implementation("com.google.mlkit:text-recognition-japanese:16.0.1")
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <application
+                  android:label="@string/app_name"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".TranslatorService"
+                      android:exported="true"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/res/xml/accessibility_config.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowContentChanged|typeWindowStateChanged|typeViewScrolled"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canRetrieveWindowContent="true"
+              android:canTakeScreenshot="true"
+              android:notificationTimeout="300"
+              android:description="@string/service_desc" />
+          EOF
+
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <resources>
+              <string name="app_name">Dịch Màn Hình</string>
+              <string name="service_desc">Đọc chữ trên màn hình để dịch sang tiếng Việt và hiển thị đè lên chữ gốc.</string>
+          </resources>
+          EOF
+
+          cat > $P/ClaudeClient.kt <<'EOF'
+          package com.example.screentranslator
+
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+
+          object ClaudeClient {
+              private const val MODEL = "claude-haiku-5-5"
+              private const val SYSTEM =
+                  "Bạn là công cụ dịch giao diện điện thoại. Dịch các đoạn văn bản tiếng Anh, Trung, Nhật " +
+                  "sang tiếng Việt tự nhiên như người bản xứ, đúng ngữ cảnh ứng dụng (tin nhắn thân mật, tin tức, " +
+                  "game, nút bấm, menu...). Dùng cách nói thông dụng hiện nay, không dịch word-by-word. " +
+                  "Giữ nguyên tên riêng, emoji, số liệu; độ dài ngắn gọn gần bản gốc vì bản dịch hiển thị đè lên chữ gốc. " +
+                  "Nếu đoạn đã là tiếng Việt hoặc không phải Anh/Trung/Nhật, trả lại nguyên văn. " +
+                  "Chỉ trả về MỘT mảng JSON các chuỗi, cùng thứ tự và số lượng với đầu vào, không giải thích."
+
+              fun translate(apiKey: String, pkg: String, texts: List<String>): List<String>? = try {
+                  val body = JSONObject()
+                      .put("model", MODEL)
+                      .put("max_tokens", 2000)
+                      .put("system", SYSTEM)
+                      .put("messages", JSONArray().put(JSONObject()
+                          .put("role", "user")
+                          .put("content", "Ứng dụng: $pkg\nDịch mảng sau:\n" + JSONArray(texts).toString())))
+                  val c = URL("https://api.anthropic.com/v1/messages").openConnection() as HttpURLConnection
+                  c.requestMethod = "POST"
+                  c.connectTimeout = 10000
+                  c.readTimeout = 30000
+                  c.doOutput = true
+                  c.setRequestProperty("content-type", "application/json")
+                  c.setRequestProperty("x-api-key", apiKey)
+                  c.setRequestProperty("anthropic-version", "2023-06-01")
+                  c.outputStream.use { it.write(body.toString().toByteArray()) }
+                  if (c.responseCode != 200) null else {
+                      val resp = c.inputStream.bufferedReader().use { it.readText() }
+                      val text = JSONObject(resp).getJSONArray("content").getJSONObject(0).getString("text")
+                      val arr = JSONArray(text.substring(text.indexOf('['), text.lastIndexOf(']') + 1))
+                      if (arr.length() != texts.size) null else List(arr.length()) { arr.getString(it) }
+                  }
+              } catch (e: Exception) {
+                  null
+              }
+          }
+          EOF
+
+          cat > $P/MainActivity.kt <<'EOF'
+          package com.example.screentranslator
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.text.InputType
+          import android.widget.*
+
+          class MainActivity : Activity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val prefs = getSharedPreferences("cfg", MODE_PRIVATE)
+                  val pad = (20 * resources.displayMetrics.density).toInt()
+                  val col = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(pad, pad * 2, pad, pad)
+                  }
+                  col.addView(TextView(this).apply {
+                      text = "Dịch Màn Hình (Anh/Trung/Nhật → Việt)\n\n" +
+                          "1. Dán Claude API key và bấm Lưu.\n" +
+                          "2. Bấm 'Bật dịch vụ trợ năng', chọn 'Dịch Màn Hình' và bật lên.\n" +
+                          "3. Mở app bất kỳ, bấm nút 'VI' nổi bên cạnh màn hình để bật/tắt dịch."
+                      textSize = 16f
+                  })
+                  val key = EditText(this).apply {
+                      hint = "sk-ant-..."
+                      setText(prefs.getString("api_key", ""))
+                      inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                  }
+                  col.addView(key)
+                  col.addView(Button(this).apply {
+                      text = "Lưu API key"
+                      setOnClickListener {
+                          prefs.edit().putString("api_key", key.text.toString().trim()).apply()
+                          Toast.makeText(context, "Đã lưu", Toast.LENGTH_SHORT).show()
+                      }
+                  })
+                  col.addView(CheckBox(this).apply {
+                      text = "Luôn dùng OCR (dịch cả chữ trong ảnh/game, chậm hơn, cần Android 11+)"
+                      isChecked = prefs.getBoolean("ocr_always", false)
+                      setOnCheckedChangeListener { _, on -> prefs.edit().putBoolean("ocr_always", on).apply() }
+                  })
+                  col.addView(Button(this).apply {
+                      text = "Bật dịch vụ trợ năng"
+                      setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                  })
+                  setContentView(ScrollView(this).apply { addView(col) })
+              }
+          }
+          EOF
+
+          cat > $P/TranslatorService.kt <<'EOF'
+          package com.example.screentranslator
+
+          import android.accessibilityservice.AccessibilityService
+          import android.graphics.Bitmap
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.graphics.Rect
+          import android.os.Build
+          import android.os.Handler
+          import android.os.Looper
+          import android.util.TypedValue
+          import android.view.Display
+          import android.view.Gravity
+          import android.view.View
+          import android.view.WindowManager
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+          import android.widget.FrameLayout
+          import android.widget.TextView
+          import android.widget.Toast
+          import com.google.mlkit.vision.common.InputImage
+          import com.google.mlkit.vision.text.TextRecognition
+          import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions
+          import com.google.mlkit.vision.text.japanese.JapaneseTextRecognizerOptions
+          import java.util.concurrent.Executors
+
+          class TranslatorService : AccessibilityService() {
+              private val handler = Handler(Looper.getMainLooper())
+              private val executor = Executors.newSingleThreadExecutor()
+              private val cache = HashMap<String, String>()
+              private val wm by lazy { getSystemService(WINDOW_SERVICE) as WindowManager }
+              private val zh by lazy { TextRecognition.getClient(ChineseTextRecognizerOptions.Builder().build()) }
+              private val ja by lazy { TextRecognition.getClient(JapaneseTextRecognizerOptions.Builder().build()) }
+              private var overlay: FrameLayout? = null
+              private var button: TextView? = null
+              private var enabled = false
+              private var ocrBusy = false
+              private var gen = 0
+              private val scan = Runnable { scanScreen() }
+
+              private val cjk = Regex("[\\u3040-\\u30ff\\u3400-\\u9fff]")
+              private val kana = Regex("[\\u3040-\\u30ff]")
+              private val viet = Regex("[ăâđêôơưàáảãạằắẳẵặầấẩẫậèéẻẽẹềếểễệìíỉĩịòóỏõọồốổỗộờớởỡợùúủũụừứửữựỳýỷỹỵ]", RegexOption.IGNORE_CASE)
+              private val latin = Regex("[A-Za-z]{3,}")
+
+              override fun onServiceConnected() { addButton() }
+
+              override fun onAccessibilityEvent(e: AccessibilityEvent) {
+                  if (!enabled || e.packageName == packageName) return
+                  if (e.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED) overlay?.removeAllViews()
+                  handler.removeCallbacks(scan)
+                  handler.postDelayed(scan, 800)
+              }
+
+              override fun onInterrupt() {}
+
+              override fun onDestroy() {
+                  handler.removeCallbacksAndMessages(null)
+                  executor.shutdownNow()
+                  removeOverlay()
+                  button?.let { try { wm.removeView(it) } catch (_: Exception) {} }
+                  super.onDestroy()
+              }
+
+              private fun needsTranslation(t: String) =
+                  cjk.containsMatchIn(t) || (latin.containsMatchIn(t) && !viet.containsMatchIn(t))
+
+              private fun collect(n: AccessibilityNodeInfo?, out: MutableList<Pair<String, Rect>>) {
+                  if (n == null || out.size >= 40) return
+                  if (n.isVisibleToUser && !n.isEditable && !n.isPassword) {
+                      val t = n.text?.toString()?.trim()
+                      if (!t.isNullOrEmpty() && t.length <= 400 && needsTranslation(t)) {
+                          val r = Rect()
+                          n.getBoundsInScreen(r)
+                          if (r.width() > 0 && r.height() > 0) out.add(t to r)
+                      }
+                  }
+                  for (i in 0 until n.childCount) {
+                      val c = n.getChild(i)
+                      collect(c, out)
+                      c?.recycle()
+                  }
+              }
+
+              private fun scanScreen() {
+                  if (!enabled) return
+                  val root = rootInActiveWindow ?: return
+                  val pkg = root.packageName?.toString() ?: ""
+                  if (pkg == packageName) { root.recycle(); return }
+                  val items = ArrayList<Pair<String, Rect>>()
+                  collect(root, items)
+                  root.recycle()
+
+                  val always = getSharedPreferences("cfg", MODE_PRIVATE).getBoolean("ocr_always", false)
+                  if ((always || items.size < 3) && Build.VERSION.SDK_INT >= 30) {
+                      ocrScan(pkg)
+                  } else if (items.isEmpty()) {
+                      overlay?.removeAllViews()
+                  } else {
+                      translateAndRender(items, pkg)
+                  }
+              }
+
+              private fun ocrScan(pkg: String) {
+                  if (ocrBusy) return
+                  ocrBusy = true
+                  overlay?.visibility = View.INVISIBLE
+                  button?.visibility = View.INVISIBLE
+                  handler.postDelayed({
+                      takeScreenshot(Display.DEFAULT_DISPLAY, mainExecutor, object : TakeScreenshotCallback {
+                          override fun onSuccess(r: ScreenshotResult) {
+                              restoreViews()
+                              val hb = r.hardwareBuffer
+                              val bmp = Bitmap.wrapHardwareBuffer(hb, r.colorSpace)?.copy(Bitmap.Config.ARGB_8888, false)
+                              hb.close()
+                              if (bmp == null) ocrBusy = false else runOcr(bmp, pkg)
+                          }
+                          override fun onFailure(errorCode: Int) { restoreViews(); ocrBusy = false }
+                      })
+                  }, 120)
+              }
+
+              private fun restoreViews() {
+                  overlay?.visibility = View.VISIBLE
+                  button?.visibility = View.VISIBLE
+              }
+
+              private fun runOcr(bmp: Bitmap, pkg: String) {
+                  val img = InputImage.fromBitmap(bmp, 0)
+                  val lines = ArrayList<Pair<String, Rect>>()
+                  zh.process(img).addOnSuccessListener { t ->
+                      for (b in t.textBlocks) for (l in b.lines) l.boundingBox?.let { lines.add(l.text.trim() to it) }
+                      ja.process(img).addOnSuccessListener { t2 ->
+                          for (b in t2.textBlocks) for (l in b.lines) {
+                              val bb = l.boundingBox ?: continue
+                              if (kana.containsMatchIn(l.text)) {
+                                  lines.removeAll { Rect.intersects(it.second, bb) }
+                                  lines.add(l.text.trim() to bb)
+                              }
+                          }
+                          finishOcr(bmp, lines, pkg)
+                      }.addOnFailureListener { finishOcr(bmp, lines, pkg) }
+                  }.addOnFailureListener { bmp.recycle(); ocrBusy = false }
+              }
+
+              private fun finishOcr(bmp: Bitmap, lines: List<Pair<String, Rect>>, pkg: String) {
+                  bmp.recycle()
+                  ocrBusy = false
+                  val items = lines.filter { it.first.isNotEmpty() && it.first.length <= 400 && needsTranslation(it.first) }.take(40)
+                  if (items.isEmpty()) overlay?.removeAllViews() else translateAndRender(items, pkg)
+              }
+
+              private fun translateAndRender(items: List<Pair<String, Rect>>, pkg: String) {
+                  val missing = items.map { it.first }.distinct().filter { !cache.containsKey(it) }
+                  if (missing.isEmpty()) { render(items); return }
+                  val key = getSharedPreferences("cfg", MODE_PRIVATE).getString("api_key", "") ?: ""
+                  if (key.isBlank()) {
+                      Toast.makeText(this, "Chưa nhập API key trong app Dịch Màn Hình", Toast.LENGTH_LONG).show()
+                      return
+                  }
+                  val myGen = ++gen
+                  executor.execute {
+                      val result = ClaudeClient.translate(key, pkg, missing)
+                      handler.post {
+                          if (result != null) {
+                              if (cache.size > 2000) cache.clear()
+                              missing.forEachIndexed { i, s -> cache[s] = result[i] }
+                          }
+                          if (myGen == gen) render(items)
+                      }
+                  }
+              }
+
+              private fun render(items: List<Pair<String, Rect>>) {
+                  if (!enabled) return
+                  val ov = overlay ?: FrameLayout(this).also {
+                      overlay = it
+                      wm.addView(it, overlayParams())
+                  }
+                  ov.removeAllViews()
+                  for ((src, r) in items) {
+                      val vi = cache[src] ?: continue
+                      if (vi == src) continue
+                      val tv = TextView(this).apply {
+                          text = vi
+                          setTextColor(Color.WHITE)
+                          setBackgroundColor(0xF0202124.toInt())
+                          setPadding(6, 2, 6, 2)
+                          gravity = Gravity.CENTER_VERTICAL
+                          setAutoSizeTextTypeUniformWithConfiguration(8, 18, 1, TypedValue.COMPLEX_UNIT_SP)
+                      }
+                      val lp = FrameLayout.LayoutParams(r.width(), r.height())
+                      lp.leftMargin = r.left
+                      lp.topMargin = r.top
+                      ov.addView(tv, lp)
+                  }
+              }
+
+              private fun overlayParams() = WindowManager.LayoutParams(
+                  WindowManager.LayoutParams.MATCH_PARENT,
+                  WindowManager.LayoutParams.MATCH_PARENT,
+                  WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                  WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                      WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                      WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                      WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                  PixelFormat.TRANSLUCENT
+              ).apply {
+                  gravity = Gravity.TOP or Gravity.START
+                  if (Build.VERSION.SDK_INT >= 28)
+                      layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+              }
+
+              private fun removeOverlay() {
+                  overlay?.let { try { wm.removeView(it) } catch (_: Exception) {} }
+                  overlay = null
+              }
+
+              private fun addButton() {
+                  val b = TextView(this).apply {
+                      text = "VI"
+                      setTextColor(Color.WHITE)
+                      textSize = 14f
+                      gravity = Gravity.CENTER
+                      setBackgroundColor(0xCC555555.toInt())
+                      setPadding(24, 24, 24, 24)
+                      setOnClickListener {
+                          enabled = !enabled
+                          setBackgroundColor(if (enabled) 0xCC1B8A3A.toInt() else 0xCC555555.toInt())
+                          if (enabled) scanScreen() else { handler.removeCallbacks(scan); removeOverlay() }
+                      }
+                  }
+                  button = b
+                  wm.addView(b, WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                      PixelFormat.TRANSLUCENT
+                  ).apply { gravity = Gravity.END or Gravity.CENTER_VERTICAL })
+              }
+          }
+          EOF
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ScreenTranslator-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Publish release (khi push tag vX.Y)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: app/build/outputs/apk/debug/app-debug.apk
